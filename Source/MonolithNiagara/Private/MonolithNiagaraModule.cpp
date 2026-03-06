@@ -1,16 +1,14 @@
 #include "MonolithNiagaraModule.h"
+#include "MonolithJsonUtils.h"
 #include "MonolithNiagaraActions.h"
 #include "MonolithToolRegistry.h"
-#include "MonolithSettings.h"
 
 #define LOCTEXT_NAMESPACE "FMonolithNiagaraModule"
 
 void FMonolithNiagaraModule::StartupModule()
 {
-	if (!GetDefault<UMonolithSettings>()->bEnableNiagara) return;
-
 	FMonolithNiagaraActions::RegisterActions(FMonolithToolRegistry::Get());
-	UE_LOG(LogTemp, Log, TEXT("Monolith — Niagara module loaded (39 actions)"));
+	UE_LOG(LogMonolith, Verbose, TEXT("Monolith — Niagara module loaded (39 actions)"));
 }
 
 void FMonolithNiagaraModule::ShutdownModule()

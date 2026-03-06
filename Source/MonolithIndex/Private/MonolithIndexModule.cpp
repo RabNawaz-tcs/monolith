@@ -1,6 +1,6 @@
 #include "MonolithIndexModule.h"
+#include "MonolithIndexDatabase.h"
 #include "MonolithToolRegistry.h"
-#include "MonolithSettings.h"
 #include "Actions/ProjectSearchAction.h"
 #include "Actions/ProjectFindReferencesAction.h"
 #include "Actions/ProjectFindByTypeAction.h"
@@ -11,9 +11,7 @@
 
 void FMonolithIndexModule::StartupModule()
 {
-	if (!GetDefault<UMonolithSettings>()->bEnableIndex) return;
-
-	UE_LOG(LogTemp, Log, TEXT("Monolith -- Index module loaded (5 actions, SQLite+FTS5)"));
+	UE_LOG(LogMonolithIndex, Verbose, TEXT("Monolith -- Index module loaded (5 actions, SQLite+FTS5)"));
 
 	FMonolithToolRegistry& Registry = FMonolithToolRegistry::Get();
 
