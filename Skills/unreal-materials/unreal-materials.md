@@ -13,6 +13,18 @@ You have access to **Monolith** with 46 material actions via `material.query()`.
 monolith.discover({ namespace: "material" })
 ```
 
+## Asset Path Conventions
+
+All asset paths follow UE content browser format (no .uasset extension):
+
+| Location | Path Format | Example |
+|----------|------------|---------|
+| Project Content/ | `/Game/Path/To/Asset` | `/Game/Materials/M_Rock` |
+| Project Plugins/ | `/PluginName/Path/To/Asset` | `/CarnageFX/Materials/M_Blood` |
+| Engine Plugins | `/PluginName/Path/To/Asset` | `/Niagara/DefaultAssets/SystemAssets/NS_Default` |
+
+**Note:** For project plugins, the path starts with the plugin name as configured in the .uplugin file's "MountPoint" — which defaults to `/<PluginName>/`. Most plugins mount their Content/ folder there directly.
+
 ## Key Actions
 
 | Action | Purpose |
@@ -35,7 +47,7 @@ monolith.discover({ namespace: "material" })
 ### 1. Create a material and build the full graph in one call
 ```
 material.query({ action: "build_material_graph", params: {
-  asset: "/Game/Materials/M_Rock",
+  asset: "/Game/Materials/M_Rock",  // or "/MyPlugin/Materials/M_Rock" for plugin assets
   create_if_missing: true,
   nodes: [
     { type: "TextureSample", name: "BaseColor", params: { Texture: "/Game/Textures/T_Rock_D" } },
@@ -78,4 +90,4 @@ material.query({ action: "end_transaction", params: { asset: "/Game/Materials/M_
 - Always call `validate_material` after graph changes
 - `build_material_graph` is the fastest way to create complex graphs — single JSON spec for all nodes + wires
 - Use `export_material_graph` to snapshot a graph before making destructive changes
-- Asset paths use `/Game/Path/To/Asset` format (no extension)
+- Asset paths follow the conventions in the Asset Path Conventions section above

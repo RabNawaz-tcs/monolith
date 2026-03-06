@@ -13,6 +13,18 @@ You have access to **Monolith** with 11 editor diagnostic actions via `editor.qu
 monolith.discover({ namespace: "editor" })
 ```
 
+## Asset Path Conventions
+
+All asset paths follow UE content browser format (no .uasset extension):
+
+| Location | Path Format | Example |
+|----------|------------|--------|
+| Project Content/ | `/Game/Path/To/Asset` | `/Game/Materials/M_Rock` |
+| Project Plugins/ | `/PluginName/Path/To/Asset` | `/CarnageFX/Materials/M_Blood` |
+| Engine Plugins | `/PluginName/Path/To/Asset` | `/Niagara/DefaultAssets/SystemAssets/NS_Default` |
+
+**Note:** For project plugins, the path starts with the plugin name as configured in the .uplugin file's "MountPoint" — which defaults to `/<PluginName>/`. Most plugins mount their Content/ folder there directly.
+
 ## Action Reference
 
 | Action | Purpose |
@@ -77,7 +89,7 @@ source.query({ action: "get_include_path", params: { symbol: "FMyStruct" } })
 
 ### Package/Asset errors
 - `CreatePackage` with same path returns existing in-memory package — use unique names
-- Asset paths must use `/Game/...` format with no file extension
+- Asset paths use content browser format with no file extension — see Asset Path Conventions above
 
 ## Tips
 

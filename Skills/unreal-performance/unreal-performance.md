@@ -7,6 +7,18 @@ description: Use when analyzing or optimizing Unreal Engine performance via Mono
 
 You have access to **Monolith** with cross-domain performance tools.
 
+## Asset Path Conventions
+
+All asset paths follow UE content browser format (no .uasset extension):
+
+| Location | Path Format | Example |
+|----------|------------|--------|
+| Project Content/ | `/Game/Path/To/Asset` | `/Game/Materials/M_Rock` |
+| Project Plugins/ | `/PluginName/Path/To/Asset` | `/CarnageFX/Materials/M_Blood` |
+| Engine Plugins | `/PluginName/Path/To/Asset` | `/Niagara/DefaultAssets/SystemAssets/NS_Default` |
+
+**Note:** For project plugins, the path starts with the plugin name as configured in the .uplugin file's "MountPoint" — which defaults to `/<PluginName>/`. Most plugins mount their Content/ folder there directly.
+
 ## Key Tools by Domain
 
 ### Config Auditing (`config.query`)

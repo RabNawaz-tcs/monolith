@@ -13,6 +13,18 @@ You have access to **Monolith** with animation inspection and editing via `anima
 monolith.discover({ namespace: "animation" })
 ```
 
+## Asset Path Conventions
+
+All asset paths follow UE content browser format (no .uasset extension):
+
+| Location | Path Format | Example |
+|----------|------------|---------|
+| Project Content/ | `/Game/Path/To/Asset` | `/Game/Materials/M_Rock` |
+| Project Plugins/ | `/PluginName/Path/To/Asset` | `/CarnageFX/Materials/M_Blood` |
+| Engine Plugins | `/PluginName/Path/To/Asset` | `/Niagara/DefaultAssets/SystemAssets/NS_Default` |
+
+**Note:** For project plugins, the path starts with the plugin name as configured in the .uplugin file's "MountPoint" — which defaults to `/<PluginName>/`. Most plugins mount their Content/ folder there directly.
+
 ## Action Categories
 
 ### Montage Editing
@@ -88,6 +100,6 @@ animation.query({ action: "get_skeletal_mesh_info", params: { asset: "/Game/Char
 ## Rules
 
 - Editing tools modify assets **live in the editor** — changes are immediate
-- Asset paths use `/Game/Path/To/Asset` format (no extension)
+- Asset paths follow the conventions in the Asset Path Conventions section above
 - Use `project.query("search", { query: "AM_*" })` to find animation assets first
 - ABP reading is read-only — state machine logic must be edited in the BP editor

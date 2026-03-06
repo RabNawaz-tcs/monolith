@@ -24,9 +24,18 @@ monolith.discover({ namespace: "blueprint" })
 | `get_execution_flow` | `asset`, `graph` | Trace execution wires from entry to terminal nodes |
 | `search_nodes` | `asset`, `query` | Find nodes by class name, display name, or comment |
 
-## Asset Paths
+## Asset Path Conventions
 
-All asset paths use `/Game/Path/To/Asset` format (no `.uasset` extension):
+All asset paths follow UE content browser format (no .uasset extension):
+
+| Location | Path Format | Example |
+|----------|------------|---------|
+| Project Content/ | `/Game/Path/To/Asset` | `/Game/Materials/M_Rock` |
+| Project Plugins/ | `/PluginName/Path/To/Asset` | `/CarnageFX/Materials/M_Blood` |
+| Engine Plugins | `/PluginName/Path/To/Asset` | `/Niagara/DefaultAssets/SystemAssets/NS_Default` |
+
+**Note:** For project plugins, the path starts with the plugin name as configured in the .uplugin file's "MountPoint" — which defaults to `/<PluginName>/`. Most plugins mount their Content/ folder there directly.
+
 ```
 blueprint.query({ action: "list_graphs", params: { asset: "/Game/Blueprints/BP_Player" } })
 ```

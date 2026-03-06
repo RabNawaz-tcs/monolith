@@ -13,6 +13,18 @@ You have access to **Monolith** with 70 Niagara actions via `niagara.query()`.
 monolith.discover({ namespace: "niagara" })
 ```
 
+## Asset Path Conventions
+
+All asset paths follow UE content browser format (no .uasset extension):
+
+| Location | Path Format | Example |
+|----------|------------|--------|
+| Project Content/ | `/Game/Path/To/Asset` | `/Game/Materials/M_Rock` |
+| Project Plugins/ | `/PluginName/Path/To/Asset` | `/CarnageFX/Materials/M_Blood` |
+| Engine Plugins | `/PluginName/Path/To/Asset` | `/Niagara/DefaultAssets/SystemAssets/NS_Default` |
+
+**Note:** For project plugins, the path starts with the plugin name as configured in the .uplugin file's "MountPoint" — which defaults to `/<PluginName>/`. Most plugins mount their Content/ folder there directly.
+
 ## Key Action Groups
 
 ### System Management
@@ -93,6 +105,12 @@ niagara.query({ action: "set_scalability", params: {
   system: "/Game/VFX/NS_Sparks",
   settings: { max_distance: 5000, budget_scaling: true, spawn_rate_scale_by_distance: true }
 }})
+```
+
+### Work with plugin-hosted Niagara systems
+```
+niagara.query({ action: "get_system_info", params: { system: "/CarnageFX/VFX/NS_BloodSpray" } })
+niagara.query({ action: "audit_scalability", params: { system: "/CarnageFX/VFX/NS_BloodSpray" } })
 ```
 
 ## Rules

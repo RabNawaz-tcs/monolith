@@ -13,6 +13,18 @@ You have access to **Monolith** with a deep project index via `project.query()`.
 monolith.discover({ namespace: "project" })
 ```
 
+## Asset Path Conventions
+
+All asset paths follow UE content browser format (no .uasset extension):
+
+| Location | Path Format | Example |
+|----------|------------|--------|
+| Project Content/ | `/Game/Path/To/Asset` | `/Game/Materials/M_Rock` |
+| Project Plugins/ | `/PluginName/Path/To/Asset` | `/CarnageFX/Materials/M_Blood` |
+| Engine Plugins | `/PluginName/Path/To/Asset` | `/Niagara/DefaultAssets/SystemAssets/NS_Default` |
+
+**Note:** For project plugins, the path starts with the plugin name as configured in the .uplugin file's "MountPoint" — which defaults to `/<PluginName>/`. Most plugins mount their Content/ folder there directly.
+
 ## Action Reference
 
 | Action | Purpose |
@@ -51,6 +63,11 @@ project.query({ action: "find_by_type", params: { type: "Blueprint" } })
 ### Find all assets referencing a material
 ```
 project.query({ action: "find_references", params: { asset: "/Game/Materials/M_Skin" } })
+```
+
+### Find references to a plugin asset
+```
+project.query({ action: "find_references", params: { asset: "/CarnageFX/Materials/M_Blood" } })
 ```
 
 ### Get detailed metadata for an asset
