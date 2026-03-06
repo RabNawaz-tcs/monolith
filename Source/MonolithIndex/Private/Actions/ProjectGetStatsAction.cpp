@@ -1,0 +1,37 @@
+#include "Actions/ProjectGetStatsAction.h"
+#include "MonolithIndexSubsystem.h"
+#include "Editor.h"
+
+FMonolithActionResult FProjectGetStatsAction::Execute(const TSharedPtr<FJsonObject>& Params)
+{
+	UMonolithIndexSubsystem* Subsystem = GEditor->GetEditorSubsystem<UMonolithIndexSubsystem>();
+	if (!Subsystem)
+	{
+		return FMonolithActionResult::Error(TEXT("Index subsystem not available"));
+	}
+
+	TSharedPtr<FJsonObject> Stats = Subsystem->GetStats();
+	if (!Stats.IsValid())
+	{
+		return FMonolithActionResult::Error(TEXT("Failed to retrieve stats"));
+	}
+
+	auto Result = MakeShared<FJsonObject>();
+	Result->SetBoolField(TEXT("success"), true);
+	Result->SetBoolField(TEXT("indexing"), Subsystem->IsIndexing());
+	if (Subsystem->IsIndexing())
+	{
+		Result->SetNumberField(TEXT("progress"), Subsystem->GetProgress());
+	}
+	Result->SetObjectField(TEXT("stats"), Stats);
+	return FMonolithActionResult::Success(Result);
+}
+
+TSharedPtr<FJsonObject> FProjectGetStatsAction::GetSchema()
+{
+	auto Schema = MakeShared<FJsonObject>();
+	Schema->SetStringField(TEXT("type"), TEXT("object"));
+	auto Properties = MakeShared<FJsonObject>();
+	Schema->SetObjectField(TEXT("properties"), Properties);
+	return Schema;
+}

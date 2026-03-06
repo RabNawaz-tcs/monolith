@@ -1,0 +1,74 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "0.1.0",
+	"FriendlyName": "Monolith",
+	"Description": "Unified Unreal Engine MCP server consolidating 9 domains into one plugin — Blueprints, Materials, Animation, Niagara, Editor, Config, Project Index, and Engine Source intelligence.",
+	"Category": "Editor",
+	"CreatedBy": "tumourlove",
+	"CreatedByURL": "https://github.com/tumourlove/monolith",
+	"DocsURL": "https://github.com/tumourlove/monolith/wiki",
+	"MarketplaceURL": "",
+	"CanContainContent": false,
+	"IsBetaVersion": true,
+	"IsExperimentalVersion": false,
+	"Installed": false,
+	"EnabledByDefault": true,
+	"Plugins": [
+		{
+			"Name": "Niagara",
+			"Enabled": true
+		},
+		{
+			"Name": "SQLiteCore",
+			"Enabled": true
+		}
+	],
+	"Modules": [
+		{
+			"Name": "MonolithCore",
+			"Type": "Editor",
+			"LoadingPhase": "PostEngineInit"
+		},
+		{
+			"Name": "MonolithBlueprint",
+			"Type": "Editor",
+			"LoadingPhase": "Default"
+		},
+		{
+			"Name": "MonolithMaterial",
+			"Type": "Editor",
+			"LoadingPhase": "Default"
+		},
+		{
+			"Name": "MonolithAnimation",
+			"Type": "Editor",
+			"LoadingPhase": "Default"
+		},
+		{
+			"Name": "MonolithNiagara",
+			"Type": "Editor",
+			"LoadingPhase": "Default"
+		},
+		{
+			"Name": "MonolithEditor",
+			"Type": "Editor",
+			"LoadingPhase": "Default"
+		},
+		{
+			"Name": "MonolithConfig",
+			"Type": "Editor",
+			"LoadingPhase": "Default"
+		},
+		{
+			"Name": "MonolithIndex",
+			"Type": "Editor",
+			"LoadingPhase": "Default"
+		},
+		{
+			"Name": "MonolithSource",
+			"Type": "Editor",
+			"LoadingPhase": "Default"
+		}
+	]
+}

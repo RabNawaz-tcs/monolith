@@ -1,0 +1,646 @@
+#include "MonolithHttpServer.h"
+#include "MonolithCoreModule.h"
+#include "MonolithJsonUtils.h"
+#include "MonolithToolRegistry.h"
+#include "MonolithSettings.h"
+#include "HttpServerModule.h"
+#include "HttpServerResponse.h"
+#include "Misc/Guid.h"
+
+FMonolithHttpServer::FMonolithHttpServer()
+{
+}
+
+FMonolithHttpServer::~FMonolithHttpServer()
+{
+	Stop();
+}
+
+bool FMonolithHttpServer::Start(int32 Port)
+{
+	if (bIsRunning)
+	{
+		UE_LOG(LogMonolith, Warning, TEXT("HTTP server already running on port %d"), BoundPort);
+		return true;
+	}
+
+	HttpRouter = FHttpServerModule::Get().GetHttpRouter(Port, true);
+	if (!HttpRouter.IsValid())
+	{
+		UE_LOG(LogMonolith, Error, TEXT("Failed to get HTTP router on port %d — port may be in use"), Port);
+		return false;
+	}
+
+	// Bind POST /mcp — main JSON-RPC endpoint
+	RouteHandles.Add(HttpRouter->BindRoute(
+		FHttpPath(TEXT("/mcp")),
+		EHttpServerRequestVerbs::VERB_POST,
+		FHttpRequestHandler::CreateRaw(this, &FMonolithHttpServer::HandlePostMcp)
+	));
+
+	// Bind GET /mcp — SSE endpoint for server notifications
+	RouteHandles.Add(HttpRouter->BindRoute(
+		FHttpPath(TEXT("/mcp")),
+		EHttpServerRequestVerbs::VERB_GET,
+		FHttpRequestHandler::CreateRaw(this, &FMonolithHttpServer::HandleGetMcp)
+	));
+
+	// Bind DELETE /mcp — session termination
+	RouteHandles.Add(HttpRouter->BindRoute(
+		FHttpPath(TEXT("/mcp")),
+		EHttpServerRequestVerbs::VERB_DELETE,
+		FHttpRequestHandler::CreateRaw(this, &FMonolithHttpServer::HandleDeleteMcp)
+	));
+
+	// Bind OPTIONS /mcp — CORS preflight
+	RouteHandles.Add(HttpRouter->BindRoute(
+		FHttpPath(TEXT("/mcp")),
+		EHttpServerRequestVerbs::VERB_OPTIONS,
+		FHttpRequestHandler::CreateRaw(this, &FMonolithHttpServer::HandleOptions)
+	));
+
+	FHttpServerModule::Get().StartAllListeners();
+
+	bIsRunning = true;
+	BoundPort = Port;
+
+	UE_LOG(LogMonolith, Log, TEXT("Monolith MCP server started on port %d"), Port);
+	return true;
+}
+
+void FMonolithHttpServer::Stop()
+{
+	if (!bIsRunning)
+	{
+		return;
+	}
+
+	if (HttpRouter.IsValid())
+	{
+		for (const FHttpRouteHandle& Handle : RouteHandles)
+		{
+			HttpRouter->UnbindRoute(Handle);
+		}
+		RouteHandles.Empty();
+	}
+
+	FHttpServerModule::Get().StopAllListeners();
+	HttpRouter.Reset();
+
+	{
+		FScopeLock Lock(&SessionLock);
+		ActiveSessions.Empty();
+	}
+
+	bIsRunning = false;
+	UE_LOG(LogMonolith, Log, TEXT("Monolith MCP server stopped"));
+}
+
+// ============================================================================
+// Route Handlers
+// ============================================================================
+
+bool FMonolithHttpServer::HandlePostMcp(const FHttpServerRequest& Request, const FHttpResultCallback& OnComplete)
+{
+	// Parse body as UTF-8 JSON
+	FString BodyString = FString(UTF8_TO_TCHAR(reinterpret_cast<const char*>(Request.Body.GetData())));
+	if (BodyString.IsEmpty())
+	{
+		TSharedPtr<FJsonObject> Err = FMonolithJsonUtils::ErrorResponse(
+			nullptr, FMonolithJsonUtils::ErrParseError, TEXT("Empty request body"));
+		OnComplete(MakeJsonResponse(FMonolithJsonUtils::Serialize(Err), EHttpServerResponseCodes::BadRequest));
+		return true;
+	}
+
+	// Check for session header — create one if missing (first request)
+	FString SessionId;
+	if (const TArray<FString>* SessionHeader = Request.Headers.Find(TEXT("mcp-session-id")))
+	{
+		if (SessionHeader->Num() > 0)
+		{
+			SessionId = (*SessionHeader)[0];
+		}
+	}
+
+	if (SessionId.IsEmpty())
+	{
+		SessionId = GenerateSessionId();
+		FScopeLock Lock(&SessionLock);
+		ActiveSessions.Add(SessionId);
+	}
+	else if (!IsValidSession(SessionId))
+	{
+		TSharedPtr<FJsonObject> Err = FMonolithJsonUtils::ErrorResponse(
+			nullptr, FMonolithJsonUtils::ErrInvalidRequest, TEXT("Invalid or expired session"));
+		auto Response = MakeJsonResponse(FMonolithJsonUtils::Serialize(Err), EHttpServerResponseCodes::NotFound);
+		AddCorsHeaders(*Response);
+		OnComplete(MoveTemp(Response));
+		return true;
+	}
+
+	// Try parse as JSON
+	TSharedPtr<FJsonObject> JsonRequest = FMonolithJsonUtils::Parse(BodyString);
+
+	// Could be a single request or a batch (array)
+	TArray<TSharedPtr<FJsonObject>> Requests;
+	TArray<TSharedPtr<FJsonObject>> Responses;
+
+	if (JsonRequest.IsValid())
+	{
+		// Single request
+		Requests.Add(JsonRequest);
+	}
+	else
+	{
+		// Try parsing as array (batch)
+		TArray<TSharedPtr<FJsonValue>> JsonArray;
+		TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(BodyString);
+		if (FJsonSerializer::Deserialize(Reader, JsonArray) && JsonArray.Num() > 0)
+		{
+			for (const TSharedPtr<FJsonValue>& Value : JsonArray)
+			{
+				if (Value.IsValid() && Value->Type == EJson::Object)
+				{
+					Requests.Add(Value->AsObject());
+				}
+			}
+		}
+		else
+		{
+			TSharedPtr<FJsonObject> Err = FMonolithJsonUtils::ErrorResponse(
+				nullptr, FMonolithJsonUtils::ErrParseError, TEXT("Invalid JSON"));
+			auto Response = MakeJsonResponse(FMonolithJsonUtils::Serialize(Err), EHttpServerResponseCodes::BadRequest);
+			AddCorsHeaders(*Response);
+			OnComplete(MoveTemp(Response));
+			return true;
+		}
+	}
+
+	// Process each request
+	for (const TSharedPtr<FJsonObject>& Req : Requests)
+	{
+		TSharedPtr<FJsonObject> Resp = ProcessJsonRpcRequest(Req, SessionId);
+		if (Resp.IsValid())
+		{
+			// Only add response if it's not a notification (notifications have no id)
+			Responses.Add(Resp);
+		}
+	}
+
+	// Build response
+	FString ResponseBody;
+	if (Responses.Num() == 0)
+	{
+		// All notifications — 202 Accepted with no body
+		auto Response = FHttpServerResponse::Ok();
+		Response->Code = EHttpServerResponseCodes::Accepted;
+		AddCorsHeaders(*Response);
+		Response->Headers.Add(TEXT("Mcp-Session-Id"), {SessionId});
+		OnComplete(MoveTemp(Response));
+		return true;
+	}
+	else if (Responses.Num() == 1)
+	{
+		ResponseBody = FMonolithJsonUtils::Serialize(Responses[0]);
+	}
+	else
+	{
+		// Batch response — serialize as array
+		TArray<TSharedPtr<FJsonValue>> JsonArray;
+		for (const TSharedPtr<FJsonObject>& Resp : Responses)
+		{
+			JsonArray.Add(MakeShared<FJsonValueObject>(Resp));
+		}
+		FString ArrayStr;
+		TSharedRef<TJsonWriter<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>> Writer =
+			TJsonWriterFactory<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>::Create(&ArrayStr);
+		FJsonSerializer::Serialize(JsonArray, Writer);
+		ResponseBody = ArrayStr;
+	}
+
+	auto Response = MakeJsonResponse(ResponseBody);
+	AddCorsHeaders(*Response);
+	Response->Headers.Add(TEXT("Mcp-Session-Id"), {SessionId});
+	OnComplete(MoveTemp(Response));
+	return true;
+}
+
+bool FMonolithHttpServer::HandleGetMcp(const FHttpServerRequest& Request, const FHttpResultCallback& OnComplete)
+{
+	// SSE endpoint — for now, return a simple SSE stream with a ping
+	// Full SSE streaming will be implemented when we need server-initiated notifications
+
+	FString SessionId;
+	if (const TArray<FString>* SessionHeader = Request.Headers.Find(TEXT("mcp-session-id")))
+	{
+		if (SessionHeader->Num() > 0)
+		{
+			SessionId = (*SessionHeader)[0];
+		}
+	}
+
+	if (SessionId.IsEmpty() || !IsValidSession(SessionId))
+	{
+		auto Response = FHttpServerResponse::Error(EHttpServerResponseCodes::BadRequest,
+			TEXT("BadRequest"), TEXT("Missing or invalid Mcp-Session-Id header"));
+		AddCorsHeaders(*Response);
+		OnComplete(MoveTemp(Response));
+		return true;
+	}
+
+	// Return SSE endpoint acknowledgement
+	// UE's HTTP server doesn't natively support long-lived SSE connections,
+	// so we return a single SSE event with an endpoint message and close.
+	FString SseBody = TEXT("event: endpoint\ndata: \"/mcp\"\n\n");
+	auto Response = FHttpServerResponse::Create(SseBody, TEXT("text/event-stream"));
+	Response->Code = EHttpServerResponseCodes::Ok;
+	AddCorsHeaders(*Response);
+	Response->Headers.Add(TEXT("Cache-Control"), {TEXT("no-cache")});
+	Response->Headers.Add(TEXT("Connection"), {TEXT("keep-alive")});
+	Response->Headers.Add(TEXT("Mcp-Session-Id"), {SessionId});
+	OnComplete(MoveTemp(Response));
+	return true;
+}
+
+bool FMonolithHttpServer::HandleDeleteMcp(const FHttpServerRequest& Request, const FHttpResultCallback& OnComplete)
+{
+	FString SessionId;
+	if (const TArray<FString>* SessionHeader = Request.Headers.Find(TEXT("mcp-session-id")))
+	{
+		if (SessionHeader->Num() > 0)
+		{
+			SessionId = (*SessionHeader)[0];
+		}
+	}
+
+	if (!SessionId.IsEmpty())
+	{
+		FScopeLock Lock(&SessionLock);
+		ActiveSessions.Remove(SessionId);
+		UE_LOG(LogMonolith, Verbose, TEXT("Session terminated: %s"), *SessionId);
+	}
+
+	auto Response = FHttpServerResponse::Ok();
+	AddCorsHeaders(*Response);
+	OnComplete(MoveTemp(Response));
+	return true;
+}
+
+bool FMonolithHttpServer::HandleOptions(const FHttpServerRequest& Request, const FHttpResultCallback& OnComplete)
+{
+	auto Response = FHttpServerResponse::Ok();
+	AddCorsHeaders(*Response);
+	OnComplete(MoveTemp(Response));
+	return true;
+}
+
+// ============================================================================
+// JSON-RPC 2.0 Processing
+// ============================================================================
+
+TSharedPtr<FJsonObject> FMonolithHttpServer::ProcessJsonRpcRequest(const TSharedPtr<FJsonObject>& Request, const FString& SessionId)
+{
+	if (!Request.IsValid())
+	{
+		return FMonolithJsonUtils::ErrorResponse(nullptr, FMonolithJsonUtils::ErrInvalidRequest, TEXT("Invalid request object"));
+	}
+
+	// Validate jsonrpc version
+	FString Version;
+	if (!Request->TryGetStringField(TEXT("jsonrpc"), Version) || Version != TEXT("2.0"))
+	{
+		return FMonolithJsonUtils::ErrorResponse(nullptr, FMonolithJsonUtils::ErrInvalidRequest, TEXT("Missing or invalid jsonrpc version"));
+	}
+
+	// Get method
+	FString Method;
+	if (!Request->TryGetStringField(TEXT("method"), Method))
+	{
+		return FMonolithJsonUtils::ErrorResponse(nullptr, FMonolithJsonUtils::ErrInvalidRequest, TEXT("Missing method field"));
+	}
+
+	// Get id (null for notifications)
+	TSharedPtr<FJsonValue> Id = Request->TryGetField(TEXT("id"));
+	bool bIsNotification = !Id.IsValid() || Id->IsNull();
+
+	// Get params
+	TSharedPtr<FJsonObject> Params;
+	const TSharedPtr<FJsonObject>* ParamsObj = nullptr;
+	if (Request->TryGetObjectField(TEXT("params"), ParamsObj) && ParamsObj)
+	{
+		Params = *ParamsObj;
+	}
+	if (!Params.IsValid())
+	{
+		Params = MakeShared<FJsonObject>();
+	}
+
+	UE_LOG(LogMonolith, Verbose, TEXT("JSON-RPC: %s (id=%s)"), *Method, Id.IsValid() ? *Id->AsString() : TEXT("notification"));
+
+	// Dispatch by method
+	TSharedPtr<FJsonObject> Response;
+
+	if (Method == TEXT("initialize"))
+	{
+		Response = HandleInitialize(Id, Params);
+	}
+	else if (Method == TEXT("notifications/initialized"))
+	{
+		// Notification — no response
+		return nullptr;
+	}
+	else if (Method == TEXT("tools/list"))
+	{
+		Response = HandleToolsList(Id, Params);
+	}
+	else if (Method == TEXT("tools/call"))
+	{
+		Response = HandleToolsCall(Id, Params);
+	}
+	else if (Method == TEXT("ping"))
+	{
+		Response = HandlePing(Id);
+	}
+	else
+	{
+		Response = FMonolithJsonUtils::ErrorResponse(Id, FMonolithJsonUtils::ErrMethodNotFound,
+			FString::Printf(TEXT("Unknown method: %s"), *Method));
+	}
+
+	// Notifications don't get responses
+	if (bIsNotification)
+	{
+		return nullptr;
+	}
+
+	return Response;
+}
+
+TSharedPtr<FJsonObject> FMonolithHttpServer::HandleInitialize(const TSharedPtr<FJsonValue>& Id, const TSharedPtr<FJsonObject>& Params)
+{
+	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+	Result->SetStringField(TEXT("protocolVersion"), TEXT("2025-03-26"));
+
+	// Server info
+	TSharedPtr<FJsonObject> ServerInfo = MakeShared<FJsonObject>();
+	ServerInfo->SetStringField(TEXT("name"), TEXT("monolith"));
+	ServerInfo->SetStringField(TEXT("version"), MONOLITH_VERSION);
+	Result->SetObjectField(TEXT("serverInfo"), ServerInfo);
+
+	// Capabilities
+	TSharedPtr<FJsonObject> Capabilities = MakeShared<FJsonObject>();
+
+	// We support tools
+	TSharedPtr<FJsonObject> ToolsCap = MakeShared<FJsonObject>();
+	ToolsCap->SetBoolField(TEXT("listChanged"), false);
+	Capabilities->SetObjectField(TEXT("tools"), ToolsCap);
+
+	Result->SetObjectField(TEXT("capabilities"), Capabilities);
+
+	return FMonolithJsonUtils::SuccessResponse(Id, MakeShared<FJsonValueObject>(Result));
+}
+
+TSharedPtr<FJsonObject> FMonolithHttpServer::HandleToolsList(const TSharedPtr<FJsonValue>& Id, const TSharedPtr<FJsonObject>& Params)
+{
+	FMonolithToolRegistry& Registry = FMonolithToolRegistry::Get();
+
+	TArray<TSharedPtr<FJsonValue>> ToolsArray;
+
+	// Each namespace becomes a tool
+	TArray<FString> Namespaces = Registry.GetNamespaces();
+	for (const FString& Namespace : Namespaces)
+	{
+		TArray<FMonolithActionInfo> Actions = Registry.GetActions(Namespace);
+		if (Actions.Num() == 0) continue;
+
+		// Build the tool entry for this namespace
+		// Format: "namespace.query" with action as a parameter
+		TSharedPtr<FJsonObject> Tool = MakeShared<FJsonObject>();
+
+		if (Namespace == TEXT("monolith"))
+		{
+			// Core tools are individual: monolith_discover, monolith_status
+			for (const FMonolithActionInfo& ActionInfo : Actions)
+			{
+				TSharedPtr<FJsonObject> CoreTool = MakeShared<FJsonObject>();
+				CoreTool->SetStringField(TEXT("name"), FString::Printf(TEXT("monolith_%s"), *ActionInfo.Action));
+				CoreTool->SetStringField(TEXT("description"), ActionInfo.Description);
+
+				// Input schema
+				TSharedPtr<FJsonObject> InputSchema = MakeShared<FJsonObject>();
+				InputSchema->SetStringField(TEXT("type"), TEXT("object"));
+				if (ActionInfo.ParamSchema.IsValid())
+				{
+					InputSchema->SetObjectField(TEXT("properties"), ActionInfo.ParamSchema);
+				}
+				else
+				{
+					InputSchema->SetObjectField(TEXT("properties"), MakeShared<FJsonObject>());
+				}
+				CoreTool->SetObjectField(TEXT("inputSchema"), InputSchema);
+
+				ToolsArray.Add(MakeShared<FJsonValueObject>(CoreTool));
+			}
+		}
+		else
+		{
+			// Domain tools use the dispatch pattern: namespace.query
+			FString ToolName = FString::Printf(TEXT("%s.query"), *Namespace);
+			Tool->SetStringField(TEXT("name"), ToolName);
+
+			// Build description with action list
+			FString Description = FString::Printf(TEXT("Query the %s domain. Available actions: "), *Namespace);
+			TArray<FString> ActionNames;
+			for (const FMonolithActionInfo& ActionInfo : Actions)
+			{
+				ActionNames.Add(ActionInfo.Action);
+			}
+			Description += FString::Join(ActionNames, TEXT(", "));
+			Tool->SetStringField(TEXT("description"), Description);
+
+			// Build input schema
+			TSharedPtr<FJsonObject> InputSchema = MakeShared<FJsonObject>();
+			InputSchema->SetStringField(TEXT("type"), TEXT("object"));
+
+			TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+
+			// "action" property (required)
+			TSharedPtr<FJsonObject> ActionProp = MakeShared<FJsonObject>();
+			ActionProp->SetStringField(TEXT("type"), TEXT("string"));
+			ActionProp->SetStringField(TEXT("description"), TEXT("The action to execute"));
+			TArray<TSharedPtr<FJsonValue>> EnumValues;
+			for (const FString& Name : ActionNames)
+			{
+				EnumValues.Add(MakeShared<FJsonValueString>(Name));
+			}
+			ActionProp->SetArrayField(TEXT("enum"), EnumValues);
+			Properties->SetObjectField(TEXT("action"), ActionProp);
+
+			// "params" property (optional object)
+			TSharedPtr<FJsonObject> ParamsProp = MakeShared<FJsonObject>();
+			ParamsProp->SetStringField(TEXT("type"), TEXT("object"));
+			ParamsProp->SetStringField(TEXT("description"), TEXT("Parameters for the action"));
+			Properties->SetObjectField(TEXT("params"), ParamsProp);
+
+			InputSchema->SetObjectField(TEXT("properties"), Properties);
+			InputSchema->SetArrayField(TEXT("required"), {MakeShared<FJsonValueString>(TEXT("action"))});
+
+			Tool->SetObjectField(TEXT("inputSchema"), InputSchema);
+			ToolsArray.Add(MakeShared<FJsonValueObject>(Tool));
+		}
+	}
+
+	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+	Result->SetArrayField(TEXT("tools"), ToolsArray);
+
+	return FMonolithJsonUtils::SuccessResponse(Id, MakeShared<FJsonValueObject>(Result));
+}
+
+TSharedPtr<FJsonObject> FMonolithHttpServer::HandleToolsCall(const TSharedPtr<FJsonValue>& Id, const TSharedPtr<FJsonObject>& Params)
+{
+	if (!Params.IsValid())
+	{
+		return FMonolithJsonUtils::ErrorResponse(Id, FMonolithJsonUtils::ErrInvalidParams, TEXT("Missing params"));
+	}
+
+	FString ToolName;
+	if (!Params->TryGetStringField(TEXT("name"), ToolName))
+	{
+		return FMonolithJsonUtils::ErrorResponse(Id, FMonolithJsonUtils::ErrInvalidParams, TEXT("Missing tool name"));
+	}
+
+	// Get arguments
+	TSharedPtr<FJsonObject> Arguments;
+	const TSharedPtr<FJsonObject>* ArgsObj = nullptr;
+	if (Params->TryGetObjectField(TEXT("arguments"), ArgsObj) && ArgsObj)
+	{
+		Arguments = *ArgsObj;
+	}
+	if (!Arguments.IsValid())
+	{
+		Arguments = MakeShared<FJsonObject>();
+	}
+
+	FString Namespace;
+	FString Action;
+
+	// Determine dispatch pattern
+	if (ToolName.StartsWith(TEXT("monolith_")))
+	{
+		// Core tool: monolith_discover -> namespace="monolith", action="discover"
+		Namespace = TEXT("monolith");
+		Action = ToolName.Mid(9);
+	}
+	else if (ToolName.EndsWith(TEXT(".query")))
+	{
+		// Domain tool: blueprint.query -> namespace="blueprint"
+		Namespace = ToolName.Left(ToolName.Len() - 6); // strip ".query"
+
+		if (!Arguments->TryGetStringField(TEXT("action"), Action))
+		{
+			return FMonolithJsonUtils::ErrorResponse(Id, FMonolithJsonUtils::ErrInvalidParams,
+				TEXT("Missing 'action' in arguments"));
+		}
+
+		// Extract nested params if present
+		const TSharedPtr<FJsonObject>* NestedParams = nullptr;
+		if (Arguments->TryGetObjectField(TEXT("params"), NestedParams) && NestedParams)
+		{
+			Arguments = *NestedParams;
+		}
+		else
+		{
+			Arguments = MakeShared<FJsonObject>();
+		}
+	}
+	else
+	{
+		return FMonolithJsonUtils::ErrorResponse(Id, FMonolithJsonUtils::ErrMethodNotFound,
+			FString::Printf(TEXT("Unknown tool: %s"), *ToolName));
+	}
+
+	// Execute via registry
+	FMonolithActionResult ActionResult = FMonolithToolRegistry::Get().ExecuteAction(Namespace, Action, Arguments);
+
+	// Build MCP tool result
+	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+	TArray<TSharedPtr<FJsonValue>> Content;
+
+	if (ActionResult.bSuccess)
+	{
+		TSharedPtr<FJsonObject> TextContent = MakeShared<FJsonObject>();
+		TextContent->SetStringField(TEXT("type"), TEXT("text"));
+		if (ActionResult.Result.IsValid())
+		{
+			TextContent->SetStringField(TEXT("text"), FMonolithJsonUtils::Serialize(ActionResult.Result));
+		}
+		else
+		{
+			TextContent->SetStringField(TEXT("text"), TEXT("{}"));
+		}
+		Content.Add(MakeShared<FJsonValueObject>(TextContent));
+		Result->SetBoolField(TEXT("isError"), false);
+	}
+	else
+	{
+		TSharedPtr<FJsonObject> TextContent = MakeShared<FJsonObject>();
+		TextContent->SetStringField(TEXT("type"), TEXT("text"));
+		TextContent->SetStringField(TEXT("text"), ActionResult.ErrorMessage);
+		Content.Add(MakeShared<FJsonValueObject>(TextContent));
+		Result->SetBoolField(TEXT("isError"), true);
+	}
+
+	Result->SetArrayField(TEXT("content"), Content);
+
+	return FMonolithJsonUtils::SuccessResponse(Id, MakeShared<FJsonValueObject>(Result));
+}
+
+TSharedPtr<FJsonObject> FMonolithHttpServer::HandlePing(const TSharedPtr<FJsonValue>& Id)
+{
+	return FMonolithJsonUtils::SuccessResponse(Id, MakeShared<FJsonValueObject>(MakeShared<FJsonObject>()));
+}
+
+// ============================================================================
+// Helpers
+// ============================================================================
+
+TUniquePtr<FHttpServerResponse> FMonolithHttpServer::MakeJsonResponse(const FString& JsonBody, EHttpServerResponseCodes Code)
+{
+	auto Response = FHttpServerResponse::Create(JsonBody, TEXT("application/json"));
+	Response->Code = Code;
+	return Response;
+}
+
+TUniquePtr<FHttpServerResponse> FMonolithHttpServer::MakeSseResponse(const TArray<TSharedPtr<FJsonObject>>& Messages)
+{
+	FString SseBody;
+	for (const TSharedPtr<FJsonObject>& Msg : Messages)
+	{
+		SseBody += TEXT("event: message\ndata: ");
+		SseBody += FMonolithJsonUtils::Serialize(Msg);
+		SseBody += TEXT("\n\n");
+	}
+
+	auto Response = FHttpServerResponse::Create(SseBody, TEXT("text/event-stream"));
+	Response->Code = EHttpServerResponseCodes::Ok;
+	return Response;
+}
+
+void FMonolithHttpServer::AddCorsHeaders(FHttpServerResponse& Response)
+{
+	Response.Headers.Add(TEXT("Access-Control-Allow-Origin"), {TEXT("*")});
+	Response.Headers.Add(TEXT("Access-Control-Allow-Methods"), {TEXT("GET, POST, DELETE, OPTIONS")});
+	Response.Headers.Add(TEXT("Access-Control-Allow-Headers"), {TEXT("Content-Type, Mcp-Session-Id")});
+	Response.Headers.Add(TEXT("Access-Control-Expose-Headers"), {TEXT("Mcp-Session-Id")});
+}
+
+FString FMonolithHttpServer::GenerateSessionId()
+{
+	return FGuid::NewGuid().ToString(EGuidFormats::DigitsWithHyphens);
+}
+
+bool FMonolithHttpServer::IsValidSession(const FString& SessionId) const
+{
+	FScopeLock Lock(&SessionLock);
+	return ActiveSessions.Contains(SessionId);
+}

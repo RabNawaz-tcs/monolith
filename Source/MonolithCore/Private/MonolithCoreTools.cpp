@@ -1,0 +1,255 @@
+#include "MonolithCoreTools.h"
+#include "MonolithCoreModule.h"
+#include "MonolithJsonUtils.h"
+#include "MonolithHttpServer.h"
+#include "MonolithUpdateSubsystem.h"
+#include "EditorSubsystem.h"
+#include "Misc/App.h"
+#include "Editor.h"
+
+void FMonolithCoreTools::RegisterAll()
+{
+	FMonolithToolRegistry& Registry = FMonolithToolRegistry::Get();
+
+	// monolith_discover
+	{
+		TSharedPtr<FJsonObject> Schema = MakeShared<FJsonObject>();
+		TSharedPtr<FJsonObject> NsProp = MakeShared<FJsonObject>();
+		NsProp->SetStringField(TEXT("type"), TEXT("string"));
+		NsProp->SetStringField(TEXT("description"), TEXT("Optional: filter to a specific namespace"));
+		Schema->SetObjectField(TEXT("namespace"), NsProp);
+
+		Registry.RegisterAction(
+			TEXT("monolith"), TEXT("discover"),
+			TEXT("List available tool namespaces and their actions. Pass namespace to filter."),
+			FMonolithActionHandler::CreateStatic(&FMonolithCoreTools::HandleDiscover),
+			Schema
+		);
+	}
+
+	// monolith_status
+	{
+		Registry.RegisterAction(
+			TEXT("monolith"), TEXT("status"),
+			TEXT("Get Monolith server health: version, uptime, port, registered action count, module status."),
+			FMonolithActionHandler::CreateStatic(&FMonolithCoreTools::HandleStatus)
+		);
+	}
+
+	// monolith_update
+	{
+		TSharedPtr<FJsonObject> Schema = MakeShared<FJsonObject>();
+		TSharedPtr<FJsonObject> ActionProp = MakeShared<FJsonObject>();
+		ActionProp->SetStringField(TEXT("type"), TEXT("string"));
+		ActionProp->SetStringField(TEXT("description"), TEXT("'check' to compare versions, 'install' to download and stage update"));
+		ActionProp->SetStringField(TEXT("default"), TEXT("check"));
+		Schema->SetObjectField(TEXT("action"), ActionProp);
+
+		Registry.RegisterAction(
+			TEXT("monolith"), TEXT("update"),
+			TEXT("Check for or install Monolith updates from GitHub Releases."),
+			FMonolithActionHandler::CreateStatic(&FMonolithCoreTools::HandleUpdate),
+			Schema
+		);
+	}
+
+	// monolith_reindex
+	{
+		Registry.RegisterAction(
+			TEXT("monolith"), TEXT("reindex"),
+			TEXT("Trigger a full project re-index of the Monolith project database."),
+			FMonolithActionHandler::CreateStatic(&FMonolithCoreTools::HandleReindex)
+		);
+	}
+}
+
+FMonolithActionResult FMonolithCoreTools::HandleDiscover(const TSharedPtr<FJsonObject>& Params)
+{
+	FMonolithToolRegistry& Registry = FMonolithToolRegistry::Get();
+
+	FString FilterNamespace;
+	if (Params.IsValid())
+	{
+		Params->TryGetStringField(TEXT("namespace"), FilterNamespace);
+	}
+
+	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+
+	TArray<FString> Namespaces = Registry.GetNamespaces();
+
+	if (!FilterNamespace.IsEmpty())
+	{
+		// Filter to specific namespace — return detailed action list
+		TArray<FMonolithActionInfo> Actions = Registry.GetActions(FilterNamespace);
+		if (Actions.Num() == 0)
+		{
+			return FMonolithActionResult::Error(
+				FString::Printf(TEXT("Unknown namespace: %s"), *FilterNamespace),
+				FMonolithJsonUtils::ErrInvalidParams
+			);
+		}
+
+		Result->SetStringField(TEXT("namespace"), FilterNamespace);
+		TArray<TSharedPtr<FJsonValue>> ActionArray;
+		for (const FMonolithActionInfo& ActionInfo : Actions)
+		{
+			TSharedPtr<FJsonObject> ActionObj = MakeShared<FJsonObject>();
+			ActionObj->SetStringField(TEXT("action"), ActionInfo.Action);
+			ActionObj->SetStringField(TEXT("description"), ActionInfo.Description);
+			if (ActionInfo.ParamSchema.IsValid())
+			{
+				ActionObj->SetObjectField(TEXT("params"), ActionInfo.ParamSchema);
+			}
+			ActionArray.Add(MakeShared<FJsonValueObject>(ActionObj));
+		}
+		Result->SetArrayField(TEXT("actions"), ActionArray);
+	}
+	else
+	{
+		// Return all namespaces with action counts
+		TArray<TSharedPtr<FJsonValue>> NsArray;
+		for (const FString& Ns : Namespaces)
+		{
+			TArray<FMonolithActionInfo> Actions = Registry.GetActions(Ns);
+			TSharedPtr<FJsonObject> NsObj = MakeShared<FJsonObject>();
+			NsObj->SetStringField(TEXT("namespace"), Ns);
+			NsObj->SetNumberField(TEXT("action_count"), Actions.Num());
+
+			TArray<TSharedPtr<FJsonValue>> ActionNames;
+			for (const FMonolithActionInfo& ActionInfo : Actions)
+			{
+				ActionNames.Add(MakeShared<FJsonValueString>(ActionInfo.Action));
+			}
+			NsObj->SetArrayField(TEXT("actions"), ActionNames);
+			NsArray.Add(MakeShared<FJsonValueObject>(NsObj));
+		}
+		Result->SetArrayField(TEXT("namespaces"), NsArray);
+		Result->SetNumberField(TEXT("total_actions"), Registry.GetActionCount());
+	}
+
+	return FMonolithActionResult::Success(Result);
+}
+
+FMonolithActionResult FMonolithCoreTools::HandleStatus(const TSharedPtr<FJsonObject>& Params)
+{
+	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+
+	// Version
+	Result->SetStringField(TEXT("version"), MONOLITH_VERSION);
+
+	// Server status
+	FMonolithHttpServer* Server = FMonolithCoreModule::Get().GetHttpServer();
+	Result->SetBoolField(TEXT("server_running"), Server != nullptr && Server->IsRunning());
+	Result->SetNumberField(TEXT("server_port"), Server ? Server->GetPort() : 0);
+
+	// Registry stats
+	FMonolithToolRegistry& Registry = FMonolithToolRegistry::Get();
+	Result->SetNumberField(TEXT("total_actions"), Registry.GetActionCount());
+	Result->SetNumberField(TEXT("namespaces"), Registry.GetNamespaces().Num());
+
+	// Engine info
+	Result->SetStringField(TEXT("engine_version"), FApp::GetBuildVersion());
+
+	// Project info
+	Result->SetStringField(TEXT("project_name"), FApp::GetProjectName());
+
+	return FMonolithActionResult::Success(Result);
+}
+
+FMonolithActionResult FMonolithCoreTools::HandleUpdate(const TSharedPtr<FJsonObject>& Params)
+{
+	FString Action = TEXT("check");
+	if (Params.IsValid())
+	{
+		Params->TryGetStringField(TEXT("action"), Action);
+	}
+
+	if (!GEditor)
+	{
+		return FMonolithActionResult::Error(TEXT("GEditor not available"));
+	}
+
+	UMonolithUpdateSubsystem* UpdateSubsystem = GEditor->GetEditorSubsystem<UMonolithUpdateSubsystem>();
+	if (!UpdateSubsystem)
+	{
+		return FMonolithActionResult::Error(TEXT("MonolithUpdateSubsystem not available"));
+	}
+
+	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+
+	if (Action == TEXT("check"))
+	{
+		const FMonolithVersionInfo& Info = UpdateSubsystem->GetVersionInfo();
+		Result->SetStringField(TEXT("current_version"), Info.Current);
+		Result->SetStringField(TEXT("pending_version"), Info.Pending.IsEmpty() ? TEXT("none") : Info.Pending);
+		Result->SetBoolField(TEXT("staging"), Info.bStaging);
+		Result->SetStringField(TEXT("status"), TEXT("check_initiated"));
+
+		// Trigger async check — result will come via notification
+		UpdateSubsystem->CheckForUpdate();
+
+		return FMonolithActionResult::Success(Result);
+	}
+	else if (Action == TEXT("install"))
+	{
+		// Install requires a previous check to have found a version
+		const FMonolithVersionInfo& Info = UpdateSubsystem->GetVersionInfo();
+		if (Info.bStaging)
+		{
+			Result->SetStringField(TEXT("status"), TEXT("already_staged"));
+			Result->SetStringField(TEXT("pending_version"), Info.Pending);
+			Result->SetStringField(TEXT("message"), TEXT("Update already staged. Restart the editor to apply."));
+			return FMonolithActionResult::Success(Result);
+		}
+
+		// Trigger a check that will show the notification with install button
+		UpdateSubsystem->CheckForUpdate();
+		Result->SetStringField(TEXT("status"), TEXT("checking_for_installable_update"));
+		Result->SetStringField(TEXT("message"), TEXT("Checking GitHub for latest release. If available, an install notification will appear."));
+		return FMonolithActionResult::Success(Result);
+	}
+
+	return FMonolithActionResult::Error(
+		FString::Printf(TEXT("Unknown update action: %s. Use 'check' or 'install'."), *Action),
+		FMonolithJsonUtils::ErrInvalidParams
+	);
+}
+
+FMonolithActionResult FMonolithCoreTools::HandleReindex(const TSharedPtr<FJsonObject>& Params)
+{
+	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+
+	if (!FModuleManager::Get().IsModuleLoaded(TEXT("MonolithIndex")))
+	{
+		Result->SetStringField(TEXT("status"), TEXT("module_not_loaded"));
+		Result->SetStringField(TEXT("message"), TEXT("MonolithIndex module is not loaded. Enable it in Monolith settings."));
+		return FMonolithActionResult::Success(Result);
+	}
+
+	if (!GEditor)
+	{
+		return FMonolithActionResult::Error(TEXT("GEditor not available"));
+	}
+
+	// Find the index subsystem by class name to avoid hard module dependency
+	UClass* IndexSubsystemClass = FindObject<UClass>(nullptr, TEXT("/Script/MonolithIndex.MonolithIndexSubsystem"));
+	if (IndexSubsystemClass)
+	{
+		UEditorSubsystem* IndexSubsystem = GEditor->GetEditorSubsystemBase(IndexSubsystemClass);
+		if (IndexSubsystem)
+		{
+			UFunction* RebuildFunc = IndexSubsystemClass->FindFunctionByName(TEXT("RebuildIndex"));
+			if (RebuildFunc)
+			{
+				IndexSubsystem->ProcessEvent(RebuildFunc, nullptr);
+				Result->SetStringField(TEXT("status"), TEXT("reindex_started"));
+				Result->SetStringField(TEXT("message"), TEXT("Project re-index triggered successfully."));
+				return FMonolithActionResult::Success(Result);
+			}
+		}
+	}
+
+	Result->SetStringField(TEXT("status"), TEXT("subsystem_unavailable"));
+	Result->SetStringField(TEXT("message"), TEXT("MonolithIndex module is loaded but the index subsystem could not be found."));
+	return FMonolithActionResult::Success(Result);
+}

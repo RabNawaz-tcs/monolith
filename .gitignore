@@ -1,0 +1,26 @@
+# Build artifacts
+Binaries/
+Intermediate/
+
+# Database files
+Saved/*.db
+
+# Debug symbols
+*.pdb
+
+# Python
+__pycache__/
+.venv/
+*.pyc
+*.pyo
+
+# IDE
+.vs/
+.vscode/
+.idea/
+*.sln
+*.suo
+
+# OS
+Thumbs.db
+.DS_Store
